@@ -638,6 +638,10 @@ def main():
                 )] = "telegram"
                 
             total_active_targets = len(futures)
+            has_tg = any(t == "telegram" for t in futures.values())
+            non_tg_futures = [fut for fut, t in futures.items() if t != "telegram"]
+            instant_callback_sent = False
+
             if total_active_targets > 0 and callback_url:
                 target_names = [target_labels.get(t, t) for t in futures.values()]
                 initial_step = f"uploading to {total_active_targets} targets ({', '.join(target_names)})"
@@ -674,7 +678,67 @@ def main():
                     done_labels.append(f"{lbl} (failed)")
 
                 completed_targets += 1
-                if total_active_targets > 0 and callback_url:
+
+                # INSTANT PRE-TELEGRAM CALLBACK:
+                # If Telegram is running in parallel and all web storage mirrors are finished,
+                # immediately notify DriveShare and controller so users don't have to wait for Telegram!
+                non_tg_done = bool(non_tg_futures) and all(f.done() for f in non_tg_futures)
+                has_mirror = bool(s3_final_url or existing_s3_url or target_a_url or target_b_url or target_c_url)
+                if has_tg and non_tg_done and has_mirror and not instant_callback_sent:
+                    instant_callback_sent = True
+                    log("⚡ [*] Instant Pre-Telegram Callback: All web storage mirrors ready! Dispatching instant callbacks...")
+                    
+                    mirror_done_labels = [l for l in done_labels if "Telegram" not in l]
+                    mirror_step = f"mirrors ready ({', '.join(mirror_done_labels)}) - broadcasting to Telegram..."
+                    
+                    # 1. Report mirrors_ready to Controller on VPS
+                    if callback_url and callback_token:
+                        try:
+                            report_telemetry_receipt(callback_url, callback_token, {
+                                "task_id": task_id,
+                                "file_id": target_shard_id,
+                                "filename": filename,
+                                "file_size": actual_size,
+                                "status": "mirrors_ready",
+                                "progress_pct": 75.0,
+                                "step": mirror_step,
+                                "relay_a_id": target_a_id,
+                                "relay_a_url": target_a_url,
+                                "relay_b_id": target_b_id,
+                                "relay_b_url": target_b_url,
+                                "relay_c_url": target_c_url,
+                                "s3_key": s3_final_key,
+                                "s3_url": s3_final_url or existing_s3_url,
+                            })
+                            log(f"[✓] Controller received mirrors_ready for {target_shard_id}")
+                        except Exception as e:
+                            log(f"[!] Controller instant callback failed: {e}")
+                            
+                    # 2. Direct POST to DriveShare secondary worker callback
+                    ds_url = "https://new.driveshare.top/api/secondary-worker/callback"
+                    ds_payload = {
+                        "unique_id": target_shard_id,
+                        "r2_url": s3_final_url or existing_s3_url or "",
+                        "pixeldrain_url": target_a_id or "",
+                        "gofile_url": target_b_url or "",
+                        "vikingfile_url": target_c_url or ""
+                    }
+                    try:
+                        ds_r = requests.post(ds_url, json=ds_payload, timeout=10)
+                        log(f"[✓] DriveShare instant callback notified: {ds_r.status_code}")
+                    except Exception as e:
+                        log(f"[!] DriveShare instant callback failed: {e}")
+
+                    # 3. Direct POST to user_cb if specified and not identical
+                    user_cb = cfg.get("user_cb")
+                    if user_cb and user_cb != ds_url:
+                        try:
+                            requests.post(user_cb, json=ds_payload, timeout=10)
+                            log(f"[✓] User callback notified: {user_cb}")
+                        except Exception as e:
+                            log(f"[!] User callback error: {e}")
+
+                if total_active_targets > 0 and callback_url and (not instant_callback_sent or t_name == "telegram"):
                     pct = round(52.0 + (completed_targets / total_active_targets) * 45.0, 1)
                     if pct >= 99.0:
                         pct = 98.0
