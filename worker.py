@@ -410,22 +410,59 @@ def replicate_telegram(local_path, filename, bot_token, api_id, api_hash, channe
 
         session_name = f"worker_session_{int(time.time())}"
         client = TelegramClient(session_name, int(api_id), api_hash)
-        await client.start(bot_token=bot_token)
+        
+        # Start client with FloodWait handling
+        for attempt in range(5):
+            try:
+                await client.start(bot_token=bot_token)
+                break
+            except Exception as e:
+                wait_sec = getattr(e, 'seconds', None)
+                if not wait_sec:
+                    m = re.search(r'wait of (\d+) seconds', str(e))
+                    if m:
+                        wait_sec = int(m.group(1))
+                if wait_sec:
+                    log(f"[*] Telegram FloodWait on bot auth: sleeping {wait_sec + 3}s (attempt {attempt+1}/5)...")
+                    await asyncio.sleep(wait_sec + 3)
+                else:
+                    log(f"[!] Bot start error: {e}")
+                    raise e
+
         target_peer = int(channel_id) if (str(channel_id).startswith("-100") or str(channel_id).isdigit()) else channel_id
         
         try:
-            msg = await client.send_file(
-                target_peer,
-                upload_path,
-                caption=f"{filename}\n\n⚡️ UP via MHB Pro Engine",
-                attributes=[
-                    DocumentAttributeFilename(filename),
-                    DocumentAttributeVideo(duration=0, w=1920, h=1080, supports_streaming=True)
-                ],
-                supports_streaming=True,
-                progress_callback=tg_progress
-            )
+            msg = None
+            for up_attempt in range(5):
+                try:
+                    msg = await client.send_file(
+                        target_peer,
+                        upload_path,
+                        caption=f"{filename}\n\n⚡️ UP via MHB Pro Engine",
+                        attributes=[
+                            DocumentAttributeFilename(filename),
+                            DocumentAttributeVideo(duration=0, w=1920, h=1080, supports_streaming=True)
+                        ],
+                        supports_streaming=True,
+                        progress_callback=tg_progress
+                    )
+                    break
+                except Exception as e:
+                    wait_sec = getattr(e, 'seconds', None)
+                    if not wait_sec:
+                        m = re.search(r'wait of (\d+) seconds', str(e))
+                        if m:
+                            wait_sec = int(m.group(1))
+                    if wait_sec:
+                        log(f"[*] Telegram FloodWait on upload: sleeping {wait_sec + 3}s (attempt {up_attempt+1}/5)...")
+                        await asyncio.sleep(wait_sec + 3)
+                    else:
+                        log(f"[!] Send file error: {e}")
+                        raise e
+
             await client.disconnect()
+            if not msg:
+                raise Exception("Upload failed: msg object is None")
             return msg.id
         finally:
             if created_link and os.path.exists(clean_path):
